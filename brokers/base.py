@@ -1,19 +1,27 @@
+"""
+brokers/base.py
+===============
+Abstract base class that every broker adapter must implement.
+
+All methods are async to allow non-blocking I/O across different
+broker SDKs (REST, WebSocket, TWS API, etc.).
+"""
+
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    pass
+from typing import Optional
 
 from models import Candle, Order, Position
 
 
 class BrokerBase(ABC):
-    """Abstract base class that every broker adapter must implement.
+    """
+    Common interface for all broker integrations.
 
-    All network I/O is async so that multiple brokers can be polled
-    concurrently inside the event loop.
+    Concrete subclasses live in brokers/<name>.py and handle the
+    translation between this generic API and each broker's specific
+    protocol (REST, FIX, native SDK, etc.).
     """
 
     # ------------------------------------------------------------------
@@ -23,12 +31,17 @@ class BrokerBase(ABC):
     @property
     @abstractmethod
     def name(self) -> str:
-        """Human-readable broker name, e.g. 'tradovate', 'oanda', 'ibkr'."""
+        """Short identifier for this broker, e.g. ``"oanda"``, ``"tradovate"``."""
 
     @property
     @abstractmethod
     def supported_instruments(self) -> list[str]:
-        """Return the list of instrument symbols this adapter can trade."""
+        """
+        List of instrument symbols this broker adapter can trade.
+
+        Symbols must match the keys used in ``market.universe.UNIVERSE``.
+        Example: ``["EUR_USD", "GBP_USD", "USD_JPY"]``
+        """
 
     # ------------------------------------------------------------------
     # Market data
@@ -41,31 +54,47 @@ class BrokerBase(ABC):
         timeframe: str,
         count: int,
     ) -> list[Candle]:
-        """Fetch *count* completed candles for *instrument* at *timeframe*.
+        """
+        Fetch historical OHLCV bars from the broker.
 
-        Args:
-            instrument: Symbol string as used by this broker (e.g. 'EUR_USD').
-            timeframe:  Normalised timeframe string ('1m', '5m', '15m', '1h',
-                        '4h', '1d').
-            count:      Number of completed bars to retrieve (most recent first
-                        in the broker response; implementors should return them
-                        in ascending chronological order).
+        Parameters
+        ----------
+        instrument:
+            Symbol string, e.g. ``"EUR_USD"`` or ``"MES"``.
+        timeframe:
+            Granularity string used across the whole system,
+            e.g. ``"1m"``, ``"5m"``, ``"15m"``, ``"1h"``, ``"4h"``, ``"1d"``.
+        count:
+            Number of completed bars to return (most recent ``count`` bars).
 
-        Returns:
-            List of :class:`Candle` objects in ascending time order.
+        Returns
+        -------
+        list[Candle]
+            Bars in chronological order (oldest first).
         """
 
     # ------------------------------------------------------------------
-    # Account & position queries
+    # Account / positions
     # ------------------------------------------------------------------
 
     @abstractmethod
     async def get_positions(self) -> list[Position]:
-        """Return all currently open positions on this broker account."""
+        """
+        Return all currently open positions held at this broker.
+
+        Returns
+        -------
+        list[Position]
+            Empty list if no positions are open.
+        """
 
     @abstractmethod
     async def get_account_equity(self) -> float:
-        """Return the current net liquidation value (equity) of the account."""
+        """
+        Return the current total account equity (NAV) in account currency.
+
+        For paper brokers this should return the simulated equity value.
+        """
 
     # ------------------------------------------------------------------
     # Order management
@@ -73,31 +102,41 @@ class BrokerBase(ABC):
 
     @abstractmethod
     async def place_order(self, order: Order) -> Order:
-        """Submit *order* to the broker.
+        """
+        Submit an order to the broker.
 
-        The returned :class:`Order` must have its ``broker_order_id`` and
-        ``status`` fields updated to reflect the broker's acknowledgement.
-        For market orders that fill immediately the returned order should
-        have ``status=FILLED`` and ``filled_price`` / ``filled_quantity``
-        populated.
+        The broker adapter must populate ``order.broker_order_id`` and
+        update ``order.status`` before returning the mutated ``Order``
+        object.  Do *not* raise on soft failures (rejected orders);
+        instead set ``order.status = OrderStatus.REJECTED`` and include
+        a reason in ``order.metadata["reject_reason"]``.
 
-        Args:
-            order: The order to submit.  Must not be mutated in-place;
-                   return a copy (or the same object with updated fields).
+        Parameters
+        ----------
+        order:
+            The order to submit.  ``order.id`` is already set by the
+            caller and should be preserved.
 
-        Returns:
-            Updated :class:`Order` reflecting current broker state.
+        Returns
+        -------
+        Order
+            The same object with broker-assigned fields populated.
         """
 
     @abstractmethod
     async def cancel_order(self, order_id: str) -> bool:
-        """Request cancellation of *order_id*.
+        """
+        Request cancellation of a pending/submitted order.
 
-        Args:
-            order_id: The internal (system) order id.
+        Parameters
+        ----------
+        order_id:
+            The system-level ``Order.id`` (not the broker order ID).
 
-        Returns:
-            ``True`` if the cancellation request was accepted by the broker,
+        Returns
+        -------
+        bool
+            ``True`` if the cancellation was acknowledged by the broker,
             ``False`` otherwise (e.g. order already filled).
         """
 
@@ -107,21 +146,66 @@ class BrokerBase(ABC):
 
     @abstractmethod
     async def close_position(self, instrument: str) -> bool:
-        """Close the open position for *instrument* at market.
+        """
+        Flatten (fully close) the open position for *instrument*.
 
-        Args:
-            instrument: Symbol whose position should be closed.
+        Parameters
+        ----------
+        instrument:
+            Symbol whose position should be closed.
 
-        Returns:
-            ``True`` if the close order was accepted, ``False`` otherwise.
+        Returns
+        -------
+        bool
+            ``True`` if the close order was accepted, ``False`` if there
+            was no position to close or the request failed.
         """
 
     @abstractmethod
     async def close_all_positions(self) -> bool:
-        """Close every open position on this broker account at market.
-
-        Returns:
-            ``True`` if all close orders were accepted, ``False`` if any
-            failed.  Implementors should attempt to close each position
-            individually and aggregate the results.
         """
+        Close every open position at this broker simultaneously.
+
+        Used by the emergency stop / daily-loss-limit handler.
+
+        Returns
+        -------
+        bool
+            ``True`` if all close orders were accepted without error.
+        """
+
+    # ------------------------------------------------------------------
+    # Optional lifecycle hooks (concrete classes may override)
+    # ------------------------------------------------------------------
+
+    async def connect(self) -> None:
+        """
+        Establish a connection / authenticate with the broker.
+
+        Called once at startup before any other method.  Default
+        implementation is a no-op; override when the broker requires
+        an explicit connection step (e.g. TWS socket, OAuth flow).
+        """
+
+    async def disconnect(self) -> None:
+        """
+        Gracefully close the connection to the broker.
+
+        Called during system shutdown.  Default implementation is a no-op.
+        """
+
+    async def is_connected(self) -> bool:
+        """
+        Return whether the adapter currently has an active connection.
+
+        Default implementation always returns ``True`` for brokers that
+        use stateless REST APIs.
+        """
+        return True
+
+    # ------------------------------------------------------------------
+    # String representation
+    # ------------------------------------------------------------------
+
+    def __repr__(self) -> str:
+        return f"<{self.__class__.__name__} broker={self.name!r}>"
