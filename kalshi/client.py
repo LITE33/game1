@@ -79,6 +79,58 @@ class KalshiClient:
             data = await resp.json()
         return data.get("market", {})
 
+    async def get_live_ticker(self, series_ticker: str = "KXBTC15M") -> Optional[str]:
+        """
+        Find the currently open market ticker for a given series.
+
+        Queries the markets list filtered to open/active status and returns
+        the ticker of the market closest to expiry (the one currently trading).
+
+        Returns None if no open market is found right now (e.g. between windows).
+        """
+        url = f"{BASE_REST}/markets"
+        params = {
+            "series_ticker": series_ticker,
+            "status": "open",
+            "limit": 10,
+        }
+        async with self._session.get(url, params=params) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+
+        markets = data.get("markets", [])
+        if not markets:
+            return None
+
+        # Pick the market expiring soonest — that's the live one
+        def close_key(m: dict) -> str:
+            return m.get("close_time") or m.get("expiration_time") or ""
+
+        markets.sort(key=close_key)
+        return markets[0]["ticker"]
+
+    async def wait_for_live_ticker(
+        self,
+        series_ticker: str = "KXBTC15M",
+        poll_interval: int = 10,
+        timeout: int = 300,
+    ) -> str:
+        """
+        Poll until an open market appears for the series (e.g. between windows).
+        Raises TimeoutError if none appears within `timeout` seconds.
+        """
+        import time
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            ticker = await self.get_live_ticker(series_ticker)
+            if ticker:
+                return ticker
+            remaining = int(deadline - time.monotonic())
+            print(f"[client] no open market for {series_ticker}, retrying in {poll_interval}s "
+                  f"(timeout in {remaining}s)...")
+            await asyncio.sleep(poll_interval)
+        raise TimeoutError(f"No open {series_ticker} market found within {timeout}s")
+
     # ------------------------------------------------------------------
     # WebSocket
     # ------------------------------------------------------------------

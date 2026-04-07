@@ -184,9 +184,21 @@ class KalshiStorage:
         session_id: Optional[str] = None,
         limit: Optional[int] = None,
     ) -> list[dict]:
-        """Return raw snapshot rows as dicts."""
-        sql = "SELECT * FROM orderbook_snapshots WHERE ticker = ?"
-        params: list = [ticker]
+        """
+        Return raw snapshot rows as dicts.
+
+        `ticker` can be an exact market ticker ("KXBTC15M-26APR071030") or
+        a series prefix ("KXBTC15M") to match all markets in that series.
+        """
+        if "-" in ticker:
+            # Exact match
+            sql = "SELECT * FROM orderbook_snapshots WHERE ticker = ?"
+            params: list = [ticker]
+        else:
+            # Prefix match (series)
+            sql = "SELECT * FROM orderbook_snapshots WHERE ticker LIKE ?"
+            params = [f"{ticker}-%"]
+
         if session_id:
             sql += " AND session_id = ?"
             params.append(session_id)
@@ -203,6 +215,9 @@ class KalshiStorage:
     ):
         """
         Return snapshots as a pandas DataFrame (requires pandas).
+
+        `ticker` accepts exact market tickers or a series prefix like "KXBTC15M"
+        to load all data across all windows in that series.
 
         Columns: id, ticker, session_id, timestamp, seq, yes_bids, no_bids,
                  best_yes, best_no, spread, yes_depth, no_depth, event
